@@ -43,7 +43,7 @@ create table if not exists public.panic_events (
   id           uuid not null default gen_random_uuid(),
   user_id      uuid not null references auth.users (id) on delete cascade,
   occurred_at  timestamptz not null default now(),
-  urge_level   smallint check (urge_level between 1 and 10),
+  urge_level   smallint check (urge_level between 0 and 10), -- same 0-10 scale as daily_checkins
   trigger_note text check (char_length(trigger_note) <= 1000),
   message_id   uuid references public.motivational_messages (id) on delete set null,
   outcome      text check (outcome in ('resolved', 'still_struggling', 'contacted_support')),
