@@ -14,6 +14,10 @@ or down.
 
 ## Request flow
 
+Implemented as Supabase Edge Functions (`supabase/functions/panic`, `reminders`,
+`streak-cache`; shared code in `supabase/functions/_shared`). Setup and usage:
+`docs/panic-button-setup.md`.
+
 `POST /panic` (signed-in user, guest sessions allowed)
 
 1. Read cached content from Redis (messages, the user's reminders, and the
@@ -32,20 +36,26 @@ or down.
 |---|---|---|---|
 | `anchor:panic:messages:v1` | JSON array of active messages | 1 hour | message content changes (bump `v1`) |
 | `anchor:user:{userId}:reminders` | JSON array of the user's reminders | 1 hour | user adds, edits or deletes a reminder |
-| `anchor:user:{userId}:goal:{goalId}:streak` | JSON `{ goalName, currentStreak, longestStreak, asOf }` | 10 min, or until the goal's local midnight if sooner | user checks in or logs a relapse for that goal |
+| `anchor:user:{userId}:goal:{goalId}:streak` | JSON, see the contract below | 10 min, or until the goal's local midnight if sooner | user checks in or logs a relapse for that goal |
+| `anchor:user:{userId}:goals` | JSON array of `{ goalId, timeZone }` (lets the panic endpoint find the user's streak keys without a database read) | 10 min | goal created, edited or deleted (the streak helpers clear it) |
 
 - Streaks are per recovery goal, matching the Streak Engine's `recovery_goals`
   and `daily_checkins` tables. The JSON fields mirror the `streak_stats` view
   (`goal_name`, `current_streak`, `longest_streak`); `asOf` is its `local_today`.
-- The streak key is **written by the Streak Engine owner**. The panic endpoint
-  only reads it, and falls back to querying `streak_stats` on a miss.
+- **Proposed (pending Sahar's confirmation):** the Redis helper is owned by the
+  Panic Button & Redis role. The Streak Engine does not talk to Redis; it calls
+  `POST /streak-cache {goalId}` (or `writeStreakCache(deps, userId, goalId)`) after a
+  check-in, a relapse or a goal edit, and `DELETE /streak-cache {goalId}` when a
+  goal is deleted. The helper reads `streak_stats` and overwrites the entry. The
+  panic endpoint only reads the key, and falls back to querying `streak_stats`
+  on a miss.
 - `current_streak` depends on "today" in the goal's own time zone (one grace
   day, relapse resets to 0), so a cached value can become wrong at local
   midnight. That is why the TTL ends at the goal's local midnight.
 - Keys containing a `userId` hold private recovery data: short TTLs, and never
   log their values.
 
-### Streak cache contract (writer: Streak Engine, reader: Panic Button)
+### Streak cache contract (writer: the Redis helper, called by the Streak Engine; reader: Panic Button)
 
 Both modules must use exactly this shape, so neither side guesses:
 
@@ -89,7 +99,7 @@ operation itself, not necessarily for the full request. Measure both and report
 both in the final write-up. Pick the Upstash region closest to where the app is
 deployed.
 
-## Test cases (Vitest)
+## Test cases (Deno test: `deno test supabase/functions/_shared/`)
 
 - Cache hit returns content without calling the database.
 - Cache miss loads from the database and populates Redis.
@@ -98,14 +108,24 @@ deployed.
 - Reminders cache is cleared after a reminder is added or deleted.
 - A streak cache entry expires at the goal's local midnight, not only after 10 minutes.
 - A panic event can only be linked to a goal owned by the same user.
-- RLS: a user cannot read or modify another user's `panic_events` or `personal_reminders`.
+- RLS: a user cannot read or modify another user's `panic_events` or `personal_reminders`
+  (`database/tests/panic_button_rls_test.sql`, run in the Supabase SQL editor).
+- The React screen (`frontend/panic-button/PanicButton.test.tsx`, Vitest): shows the
+  content, still helps when the server cannot be reached, saves outcome and urge level.
 
 ## Open questions for the team
 
-- Stack and folder layout for `backend/` (this note is stack-neutral).
-- Who owns the shared Redis client and env vars (`UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`)?
+- Backend stack: **proposed** Supabase Edge Functions (the Upstash token must stay
+  server-side, and no separate server is needed). Waiting for the team to agree.
+- Redis client and env vars (`UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`):
+  owned by the Panic Button & Redis role (`supabase/functions/_shared/redis.ts`).
 - Confirm the per-goal streak cache entry above with the Streak Engine owner
   (Sahar), including who writes it and when it is invalidated.
-- Her grace-day and time-zone rules are still "pending team approval"; the TTL
-  logic here follows whatever the team settles on.
+- Her grace-day and time-zone rules are still "pending team approval". Proposed:
+  one time zone per user on the profile. Today the TTL uses `recovery_goals.time_zone`;
+  moving it to the profile only changes `loadGoals` in `supabase/functions/_shared/db.ts`.
+- `streak_stats` has no `user_id` column and is a normal view, so by default it runs
+  with its owner's rights and may let any signed-in user read other users' streaks.
+  For Sahar: add `security_invoker = true` (or a `user_id` column plus a filter) so it
+  respects RLS. The functions here filter by the user's own goal ids either way.
 - Whether `panic_events` gets partitioned in Sprint 2 (the primary key already allows it).
